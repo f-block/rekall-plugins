@@ -1,4 +1,4 @@
-#  DESCRIPTION
+#  This plugin reveals all executable pages
 #
 #    Copyright (c) 2019, Frank Block, ERNW Research GmbH <fblock@ernw.de>
 #
@@ -26,11 +26,10 @@
 #       OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 #       OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-"""Description for the plugin
-
+"""
 To include this plugin, place it (or a symlink) into the rekall/plugins/windows
 folder and add an entry to the __init__.py file, similar to this:
-    from rekall.plugins.windows import basic
+    from rekall.plugins.windows import ptenum
 """
 
 __author__ = "Frank Block <fblock@ernw.de>"
@@ -46,7 +45,10 @@ from rekall.plugins.windows import pagefile
 
 
 class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
-    """Description
+    """This plugin can be seen as an improved malfind plugin. 
+    It retrieves a page’s actual protection from its PTE value and from that
+    its executable state, despite any hiding technique described in this
+    paper: https://www.dfrws.org/conferences/dfrws-usa-2019/sessions/windows-memory-forensics-detecting-unintentionally-hidden
     """
 
     name = "ptenum"
