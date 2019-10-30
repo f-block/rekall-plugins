@@ -694,14 +694,7 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
         sorted_pages = sorted(pages['x_pages'], key=lambda x: x.start)
         first_page = sorted_pages[0]
         first_printable_page = first_page
-
-        if type(vad) == int:
-            memory_area_start = first_page.start
-        elif self.plugin_args.start:
-            # start address gets page aligned
-            memory_area_start = self.plugin_args.start & ~ 0xfff
-        else:
-            memory_area_start = vad.Start
+        memory_area_start = first_page.start if type(vad) == int else vad.Start
 
         i=1
         while not first_printable_page.file_offset and i < len(sorted_pages):
@@ -768,7 +761,10 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
                 renderer.format("\n")
                 return
     
-            skipped_bytes = int(first_page.start - memory_area_start)
+            first_byte = \
+                self.plugin_args.start &~ 0xfff if self.plugin_args.start \
+                                                else memory_area_start
+            skipped_bytes = int(first_page.start - first_byte)
             if skipped_bytes:
                 renderer.format(
                     "Skipping the first {0} bytes, as they are either not "
