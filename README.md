@@ -58,3 +58,28 @@ For the current version of the Rekall plugins:
 - [zsh](https://github.com/google/rekall/blob/master/rekall-core/rekall/plugins/linux/zsh.py)
 
 The last version for Volatility can be found [here](https://github.com/volatilityfoundation/community/tree/master/FrankBlock). Note: This version is currently not being updated.
+
+# list_plugins
+
+Lists all available plugins for the current session with a description.
+
+```
+$ rekall -f win10.dump list_plugins
+       plugin                                          description                                   
+-------------------- --------------------------------------------------------------------------------
+address_resolver     A windows specific address resolver plugin.                                     
+aff4acquire          Copy the physical address space to an AFF4 file.                                
+                         NOTE: This plugin does not require a working profile - unless the user also 
+                         wants to copy the pagefile or mapped files. In that case we must analyze the
+                         live memory to gather the required files.                                   
+aff4dump             Dump the entire resolver contents for an AFF4 volume.                           
+aff4export           Exports all the streams in an AFF4 Volume.                                      
+aff4ls               List the content of an AFF4 file.                                               
+analyze_struct       A plugin to analyze a memory location.                                          
+api                  Generate the plugin API document.                                               
+artifact_collector   Collects artifacts.                                                             
+artifact_list        List details about all known artifacts.                                         
+artifact_view                                                                                        
+atoms                Print session and window station atom tables.                                   
+...
+```
