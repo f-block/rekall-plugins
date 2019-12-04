@@ -46,9 +46,9 @@ rekall -f mem.dump pointerdetector 744
 
 
 # ptenum
-For more details see the following resources
-- [https://github.com/f-block/DFRWS-USA-2019](https://github.com/f-block/DFRWS-USA-2019)
-- [DFRWS USA 2019 Whitepaper and Slides](https://www.dfrws.org/conferences/dfrws-usa-2019/sessions/windows-memory-forensics-detecting-unintentionally-hidden)
+The most current version of the plugin is in this repository. Other resources:
+- The original research material can be grabbed from [https://github.com/f-block/DFRWS-USA-2019](https://github.com/f-block/DFRWS-USA-2019)
+- [DFRWS USA 2019 Research Paper and Slides](https://www.dfrws.org/conferences/dfrws-usa-2019/sessions/windows-memory-forensics-detecting-unintentionally-hidden)
 
 # Linux Glibc Heap Analysis plugins
 
