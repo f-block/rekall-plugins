@@ -44,6 +44,32 @@ from rekall.plugins.windows import common
 from rekall.plugins.windows import pagefile
 
 
+def get_vad_type_and_filename(vad):
+    if isinstance(vad, int):
+        return None
+
+    filename = ""
+    vadtype = "Private"
+    if vad.u.VadFlags.PrivateMemory == 0:
+        vadtype = "Mapped"
+        filename = "Pagefile-backed section"
+        try:
+            file_obj = vad.ControlArea.FilePointer
+            if file_obj:
+                filename = (file_obj.file_name_with_drive() or
+                            "Pagefile-backed section")
+            sec_obj_poi = file_obj.SectionObjectPointer
+            if sec_obj_poi:
+                if sec_obj_poi.ImageSectionObject:
+                    vadtype = "Mapped Image File"
+                else:
+                    vadtype = "Mapped Data File"
+        except AttributeError:
+            pass
+
+    return {'vadtype': vadtype, 'filename': str(filename)}
+
+
 class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
     """This plugin can be seen as an improved malfind plugin. 
     It retrieves a page’s actual protection from its PTE value and from that
@@ -78,7 +104,7 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
         dict(name='end', type='IntParser', default=None,
              help=("Upper limit address to examine; default: highest usermode "
                    "address")),
-        dict(name='ignore_mapped_files', type='Boolean', default=False,
+        dict(name='ignore_image_files', type='Boolean', default=False,
              help=("Don't print executable pages belonging to mapped files."))
     ]
 
@@ -658,21 +684,6 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
         return vad_run[2].vad
 
 
-    def get_vad_filename(self, vad):
-        filename = ""
-        if vad.u.VadFlags.PrivateMemory == 0:
-            filename = "Pagefile-backed section"
-            try:
-                file_obj = vad.ControlArea.FilePointer
-                if file_obj:
-                    filename = (file_obj.file_name_with_drive() or
-                                "Pagefile-backed section")
-            except AttributeError:
-                pass
-
-        return str(filename)
-
-
     def vad_contains_image_file(self, vad):
         try:
             sec_obj_poi = vad.ControlArea.FilePointer.SectionObjectPointer
@@ -682,14 +693,6 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
             pass
 
         return False
-
-
-    def vad_contains_mapped_file(self, vad):
-        if isinstance(vad, int):
-            return False
-
-        return vad.u.VadFlags.VadType.v() == 2 or \
-            self.get_vad_filename(vad) != ''
 
 
     def render_vad(self, renderer, vad, pages):
@@ -732,22 +735,12 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
                             vad.Tag, vad.u.VadFlags.ProtectionEnum)
         
             renderer.format("Flags: {0}\n", vad.u.VadFlags)
-            filename = ''
-            if self.vad_contains_mapped_file(vad):
-                filename = self.get_vad_filename(vad)
-                renderer.format("Mapped File: {0}\n", filename)
-    
-            vadtype = "Private"
-            if vad.u.VadFlags.PrivateMemory <= 0:
-                if filename == "Pagefile-backed section":
-                    vadtype = "Mapped"
-                else:
-                    sec_obj_poi = vad.ControlArea.FilePointer.SectionObjectPointer
-                    if sec_obj_poi.ImageSectionObject:
-                        vadtype = "Mapped Image File"
-                    else:
-                        vadtype = "Mapped Data File"
-            renderer.format("The Vadtype is: {0}\n", vadtype)
+            type_and_filename = get_vad_type_and_filename(vad)
+            renderer.format(
+                "The Vadtype is: {0}\n", type_and_filename['vadtype'])
+            if type_and_filename['vadtype'].startswith("Mapped"):
+                renderer.format(
+                    "Mapped File: {0}\n", type_and_filename['filename'])
 
             renderer.format(
                 "{0} non empty page(s) with a total size of {1} bytes in this "
@@ -795,17 +788,44 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
         disassembler.render(renderer, suppress_headers=True)
 
         if self.dump_dir:
-            filename = "{0}.{1:d}.{2:08x}-{3:08x}.dmp".format(
-                self.task.ImageFileName, self.task.pid, vad.Start,
-                vad.End)
+            if type(vad) == int:
+                type_string = 'page'
+                memory_area_end = \
+                    memory_area_start + first_printable_page.length - 1
+            else:
+                type_string = 'vad'
+                memory_area_end = vad.End
+
+            filename = "{0}.{1:d}.{2}.0x{3:08x}-0x{4:08x}.dmp".format(
+                self.task.ImageFileName, self.task.pid, type_string,
+                memory_area_start, memory_area_end)
     
             with renderer.open(directory=self.dump_dir,
                                filename=filename,
                                mode='wb') as fd:
+                self.session.report_progress("Dumping %s" % filename)
+
+                if type(vad) == int:
+                    fd.write(
+                        self.task_as.read(memory_area_start,
+                                          first_printable_page.length - 1))
+                
+                else:
+                    self.CopyToFile(self.task_as, memory_area_start,
+                                    memory_area_end, fd)
+
+            filename = filename[:-3] + 'idx'
+            with renderer.open(directory=self.dump_dir,
+                               filename=filename,
+                               mode='w') as fd:
                 self.session.report_progress(
-                    "Dumping %s" % filename)
+                    "Writing index file %s" % filename)
     
-                self.CopyToFile(self.task_as, vad.Start, vad.End, fd)
+                indexes = "\n".join(
+                    [hex(x.start - memory_area_start)
+                     for x in pages['x_pages']])
+                fd.write(indexes)
+
         renderer.format("\n")
 
 
@@ -875,8 +895,8 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
                     result[vad]['x_pages'].append(run)
 
             for vad, pages in result.items():
-                if self.plugin_args.ignore_mapped_files and \
-                        self.vad_contains_mapped_file(vad):
+                if self.plugin_args.ignore_image_files and \
+                        self.vad_contains_image_file(vad):
                     continue
 
                 vad_contains_imagefile = None
