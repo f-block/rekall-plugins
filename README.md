@@ -45,7 +45,10 @@ rekall -f mem.dump pointerdetector 744
 - **Count**: How often this API has been found in this VAD.
 
 
-# ptenum
+# ptemalfind (formerly known as ptenum)
+This module implements a class to enumerate all Page Table Entries (PTEs) and a plugin (ptemalfind), using this class, which can be seen as an improved version of
+malfind. It retrieves a page's actual protection from its PTE value and from that its executable state, despite any hiding technique described in the following paper.
+
 The most current version of the plugin is in this repository. Other resources:
 - The original research material can be grabbed from [https://github.com/f-block/DFRWS-USA-2019](https://github.com/f-block/DFRWS-USA-2019)
 - [DFRWS USA 2019 Research Paper and Slides](https://www.dfrws.org/conferences/dfrws-usa-2019/sessions/windows-memory-forensics-detecting-unintentionally-hidden)
