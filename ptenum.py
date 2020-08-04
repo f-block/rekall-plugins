@@ -1,6 +1,5 @@
-#  This plugin reveals all executable pages
 #
-#    Copyright (c) 2019, Frank Block, ERNW Research GmbH <fblock@ernw.de>
+#    Copyright (c) 2020, Frank Block, ERNW Research GmbH <fblock@ernw.de>
 #
 #       All rights reserved.
 #
@@ -26,10 +25,12 @@
 #       OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 #       OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-"""
-To include this plugin, place it (or a symlink) into the rekall/plugins/windows
-folder and add an entry to the __init__.py file, similar to this:
-    from rekall.plugins.windows import ptenum
+"""This module implements a class to enumerate all Page Table Entries (PTEs)
+and a plugin, using this class, which can be seen as an improved version of
+malfind.
+It retrieves a page's actual protection from its PTE value and from that
+its executable state, despite any hiding technique described in this paper:
+https://www.dfrws.org/conferences/dfrws-usa-2019/sessions/windows-memory-forensics-detecting-unintentionally-hidden
 """
 
 __author__ = "Frank Block <fblock@ernw.de>"
@@ -37,12 +38,11 @@ __author__ = "Frank Block <fblock@ernw.de>"
 import struct
 from rekall import plugin
 from rekall import addrspace
-from rekall_lib import utils
 from rekall.plugins import core
-from rekall.plugins.addrspaces import intel
 from rekall.plugins.windows import common
-from rekall.plugins.windows import pagefile
-
+from rekall.plugins.addrspaces.intel import DescriptorCollection
+from rekall.plugins.windows.pagefile import WindowsDTBDescriptor
+from rekall.plugins.addrspaces.intel import VirtualAddressDescriptor
 
 def get_vad_type_and_filename(vad):
     if isinstance(vad, int):
@@ -70,44 +70,14 @@ def get_vad_type_and_filename(vad):
     return {'vadtype': vadtype, 'filename': str(filename)}
 
 
-class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
-    """This plugin can be seen as an improved malfind plugin. 
-    It retrieves a page’s actual protection from its PTE value and from that
-    its executable state, despite any hiding technique described in this
-    paper: https://www.dfrws.org/conferences/dfrws-usa-2019/sessions/windows-memory-forensics-detecting-unintentionally-hidden
+class PteEnumerator(common.WinProcessFilter):
+    """This plugin can be seen as an improved version of malfind.
+    It retrieves a page's actual protection from its PTE value and from that
+    its executable state, despite any hiding technique described in this paper:
+    https://www.dfrws.org/conferences/dfrws-usa-2019/sessions/windows-memory-forensics-detecting-unintentionally-hidden
     """
 
-    name = "ptenum"
-    
-    dump_dir_optional = True
-    default_dump_dir = None
-    PAGE_SIZE = 0x1000
-    # The empty page test uses this a lot, so we keep it once
-    ALL_ZERO_PAGE = b"\x00" * PAGE_SIZE
-    # Those pages will probably not occur that much, and we don't want to keep
-    # a gigabyte of zeroes in memory
-    LARGE_PAGE_SIZE = 0x200000
-    LARGE_ARM_PAGE_SIZE = LARGE_PAGE_SIZE * 2
-    HUGE_PAGE_SIZE = 0x40000000
-
-
-    table_header = [
-        dict(name="divider", type="Divider"),
-        dict(name="task", hidden=True),
-        dict(name="pointer", width=12, style="address"),
-        dict(name="value", width=26),
-    ]
-    
-    __args = [
-        dict(name='start', type='IntParser', default=0,
-             help=("The lowest address to examine; default=0")),
-        dict(name='end', type='IntParser', default=None,
-             help=("Upper limit address to examine; default: highest usermode "
-                   "address")),
-        dict(name='ignore_image_files', type='Boolean', default=False,
-             help=("Don't print executable pages belonging to mapped files."))
-    ]
-
+    __abstract = True
 
     def __init__(self, *args, **kwargs):
         super(PteEnumerator, self).__init__(*args, **kwargs)
@@ -116,18 +86,36 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
         self.mmpfn_db = self.profile.get_constant_object("MmPfnDatabase")
 
         if self.session.profile.metadata("arch") == 'AMD64':
+            self.get_all_pages_method = self.get_all_pages
             self.get_exec_pages_method = self.get_executable_pages
             self.proto_pointer_identifier = 0xffffffff0000
 
         elif self.session.profile.metadata("arch") == 'I386':
+            self.get_all_pages_method = self.get_all_pages_x86
             self.get_exec_pages_method = self.get_executable_pages_x86
             self.proto_pointer_identifier = 0xffffffff
 
         else:
             raise plugin.PluginError("Unsupported architecture")
 
+        self.PAGE_SIZE = self.session.kernel_address_space.PAGE_SIZE
+        self.PAGE_BITS = self.PAGE_SIZE.bit_length() - 1
+        self.PAGE_BITS_MASK = self.PAGE_SIZE - 1
+        # The empty page test uses this a lot, so we keep it once
+        self.ALL_ZERO_PAGE = b"\x00" * self.PAGE_SIZE
+        # The following pages will probably not occur that much,
+        # and we don't want to keep a gigabyte of zeroes in memory
+        
+        # TODO make dynamic
+        self.LARGE_PAGE_SIZE = 0x200000
+        self.LARGE_PAGE_BITS = self.LARGE_PAGE_SIZE.bit_length() - 1
+        self.LARGE_ARM_PAGE_SIZE = self.LARGE_PAGE_SIZE * 2
+        self.LARGE_ARM_PAGE_BITS = self.LARGE_ARM_PAGE_SIZE.bit_length() - 1
+        self.HUGE_PAGE_SIZE = 0x40000000
+        self.HUGE_PAGE_BITS = self.HUGE_PAGE_SIZE.bit_length() - 1
 
-    # derived from rekall-core/rekall/plugins/addrspaces/amd64.py
+
+    # based on rekall-core/rekall/plugins/addrspaces/amd64.py
     def _get_available_PDPTEs(self, start=0, end=2**64):
         # Pages that hold PDEs and PTEs are 0x1000 bytes each.
         # Each PDE and PTE is eight bytes. Thus there are 0x1000 / 8 = 0x200
@@ -143,11 +131,11 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
 
             pml4e_addr = ((self.dtb & 0xffffffffff000) |
                           ((vaddr & 0xff8000000000) >> 36))
-            pml4e_value = self.task_as.read_pte(pml4e_addr)
+            pml4e_value = self.proc_as.read_pte(pml4e_addr)
 
             # TODO paged out paging structures have valid bit unset,
             # but if the pagefile is supplied, we still could read it.
-            if not pml4e_value & self.task_as.valid_mask:
+            if not pml4e_value & self.proc_as.valid_mask:
                 continue
 
             tmp1 = vaddr
@@ -164,28 +152,28 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
                 # Bits 11:3 are bits 38:30 of the linear address
                 pdpte_addr = ((pml4e_value & 0xffffffffff000) |
                               ((vaddr & 0x7FC0000000) >> 27))
-                pdpte_value = self.task_as.read_pte(pdpte_addr)
+                pdpte_value = self.proc_as.read_pte(pdpte_addr)
 
                 # TODO paged out paging structures have valid bit unset,
                 # but if the pagefile is supplied, we still could read it.
-                if not pdpte_value & self.task_as.valid_mask:
+                if not pdpte_value & self.proc_as.valid_mask:
                     continue
 
-                yield [vaddr, pdpte_value]
+                yield [vaddr, pdpte_value, pdpte_addr]
 
 
-    # derived from rekall-core/rekall/plugins/addrspaces/amd64.py
+    # based on rekall-core/rekall/plugins/addrspaces/amd64.py
     def _get_available_PDEs(self, vaddr, pdpte_value, start=0, end=2**64):
         # This reads the entire PDE table at once - On
         # windows where IO is extremely expensive, its
         # about 10 times more efficient than reading it
         # one value at the time - and this loop is HOT!
 
-        pde_table_addr = self.task_as._get_pde_addr(pdpte_value, vaddr)
+        pde_table_addr = self.proc_as._get_pde_addr(pdpte_value, vaddr)
         if pde_table_addr is None:
             return
 
-        data = self.task_as.base.read(pde_table_addr, 8 * 0x200)
+        data = self.proc_as.base.read(pde_table_addr, 8 * 0x200)
         pde_table = struct.unpack("<" + "Q" * 0x200, data)
 
         tmp2 = vaddr
@@ -203,12 +191,12 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
             # TODO Paged out paging structures have valid bit unset,
             # but if the pagefile is supplied, we still could read it.
             # Currently, we skip PDE if it is not valid or not in transition.
-            if not (pde_value & self.task_as.valid_mask or 
+            if not (pde_value & self.proc_as.valid_mask or 
                     pde_value & self.proto_transition_mask ==
                     self.transition_mask):
                 continue
 
-            yield [vaddr, pde_table[pde_index]]
+            yield [vaddr, pde_table[pde_index], pde_table_addr + pde_index * 8]
 
 
     # taken from rekall-core/rekall/plugins/windows/pagefile.py
@@ -227,7 +215,7 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
         if pte_table_addr is None:
             return
 
-        data = self.task_as.base.read(pte_table_addr, 8 * 0x200)
+        data = self.proc_as.base.read(pte_table_addr, 8 * 0x200)
         pte_table = struct.unpack("<" + "Q" * 0x200, data)
 
         tmp = vaddr
@@ -243,28 +231,66 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
             if start >= next_vaddr:
                 continue
 
-            # A PTE value of 0 means to consult the vad, but the vad shows no
-            # mapping at this virtual address, so we can just skip this PTE in
-            # the iteration.
-            if self.vad and not ignore_vad:
-                start, _, _ = self.vad.get_containing_range(vaddr)
-                if start is None:
-                    start = 0
-                    continue
-
-            yield [vaddr, pte_value]
+            yield [vaddr, pte_value, pte_table_addr+i*8]
 
 
-    def get_executable_pages(self, start=0, end=2**64):
-        """Enumerate all available ranges.
+    def get_all_pages(self, start=0, end=2**64):
+        """Simply enumerates all Paging structures and returns the virtual 
+        address and, if possible, the PFN.
 
         Yields Run objects for all available ranges in the virtual address
         space.
         """
 
-        for pdpte_vaddr, pdpte_value in self._get_available_PDPTEs(start, end):
-            if pdpte_vaddr & self.task_as.valid_mask and \
-                    pdpte_value & self.task_as.page_size_mask:
+        for pdpte_vaddr, pdpte_value, pdpte_addr in self._get_available_PDPTEs(start, end):
+            if pdpte_vaddr & self.proc_as.valid_mask and \
+                    pdpte_value & self.proc_as.page_size_mask:
+                # huge page (1 GB)
+                phys_offset = ((pdpte_value & 0xfffffc0000000) |
+                               (pdpte_vaddr & 0x3fffffff))
+                yield addrspace.Run(
+                    start=pdpte_vaddr,
+                    end=pdpte_vaddr + self.HUGE_PAGE_SIZE,
+                    file_offset=phys_offset,
+                    address_space=self.proc_as.base,
+                    data={'pte_value': pdpte_value, 'is_proto': False, 'pte_addr': pdpte_addr})
+                continue
+            
+            for pde_vaddr, pde_value, pde_addr in self._get_available_PDEs(pdpte_vaddr, pdpte_value, start, end):
+                if pde_value & self.proc_as.valid_mask and \
+                        pde_value & self.proc_as.page_size_mask:
+                    # large page
+                    phys_offset = ((pde_value & 0xfffffffe00000) |
+                                   (pde_vaddr & 0x1fffff))
+                    yield addrspace.Run(
+                        start=pde_vaddr,
+                        end=pde_vaddr + self.LARGE_PAGE_SIZE,
+                        file_offset=phys_offset,
+                        address_space=self.proc_as.base,
+                        data={'pte_value': pde_value, 'is_proto': False, 'pte_addr': pde_addr})
+                    continue
+                    
+                for vaddr, pte_value, pte_addr in self._get_available_PTEs(pde_value, pde_vaddr, start, end):
+                    phys_offset = \
+                        self._get_phys_addr_from_pte(vaddr, pte_value)
+
+                    yield addrspace.Run(start=vaddr,
+                        end=vaddr + self.PAGE_SIZE,
+                        file_offset=phys_offset,
+                        address_space=self.proc_as.base,
+                        data={'pte_value': pte_value, 'is_proto': False, 'pte_addr': pte_addr})
+
+
+    def get_executable_pages(self, start=0, end=2**64):
+        """Enumerate all available ranges for executable pages.
+
+        Yields Run objects for all available ranges in the virtual address
+        space.
+        """
+
+        for pdpte_vaddr, pdpte_value, _ in self._get_available_PDPTEs(start, end):
+            if pdpte_vaddr & self.proc_as.valid_mask and \
+                    pdpte_value & self.proc_as.page_size_mask:
                 # huge page (1 GB)
                 if not pdpte_value & self.nx_mask:
                     yield addrspace.Run(
@@ -272,13 +298,13 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
                         end=pdpte_vaddr + self.HUGE_PAGE_SIZE,
                         file_offset=((pdpte_value & 0xfffffc0000000) |
                                      (pdpte_vaddr & 0x3fffffff)),
-                        address_space=self.task_as.base,
-                        data={'pte_value': pdpte_value, 'proto': False})
+                        address_space=self.proc_as.base,
+                        data={'pte_value': pdpte_value, 'is_proto': False})
                 continue
-            
-            for pde_vaddr, pde_value in self._get_available_PDEs(pdpte_vaddr, pdpte_value, start, end):
-                if pde_value & self.task_as.valid_mask and \
-                        pde_value & self.task_as.page_size_mask:
+
+            for pde_vaddr, pde_value, _ in self._get_available_PDEs(pdpte_vaddr, pdpte_value, start, end):
+                if pde_value & self.proc_as.valid_mask and \
+                        pde_value & self.proc_as.page_size_mask:
                     # large page
                     if not pde_value & self.nx_mask:
                         yield addrspace.Run(
@@ -286,17 +312,34 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
                             end=pde_vaddr + self.LARGE_PAGE_SIZE,
                             file_offset=(pde_value & 0xfffffffe00000) | (
                                 pde_vaddr & 0x1fffff),
-                            address_space=self.task_as.base,
-                            data={'pte_value': pde_value, 'proto': False})
+                            address_space=self.proc_as.base,
+                            data={'pte_value': pde_value, 'is_proto': False})
                     continue
-                    
-                for vaddr, pte_value in self._get_available_PTEs(pde_value, pde_vaddr, start, end):
+
+                for vaddr, pte_value, _ in self._get_available_PTEs(pde_value, pde_vaddr, start, end):
                     run = self.is_page_executable(vaddr, pte_value)
                     if run:
                         yield run
 
 
-    def _is_demand_zero_pte(self, pte_value):
+    def _get_pfn_from_pte_value(self, pte_value):
+        if pte_value & self.valid_mask:
+            return ((pte_value & self.hard_pfn_mask) >> self.hard_pfn_start)
+
+        elif not (pte_value & self.prototype_mask) and pte_value & self.transition_mask:
+            return ((pte_value & self.trans_pfn_mask) >> self.trans_pfn_start)
+
+        return None
+
+
+    def _get_phys_addr_from_pte(self, vaddr, pte_value):
+        pfn = self._get_pfn_from_pte_value(pte_value)
+        if not pfn:
+            return None
+        return (pfn << self.PAGE_BITS) | (vaddr & 0xFFF)
+
+
+    def is_demand_zero_pte(self, pte_value):
         
         # We are not interested in DemandZero pages
         if pte_value == 0:
@@ -323,7 +366,7 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
         Returns:
           The offset in the physical AS where this subsection PTE is mapped to.
         """
-        if self.task_as.base_as_can_map_files:
+        if self.proc_as.base_as_can_map_files:
             if isAddress:
                 pte = self.session.profile._MMPTE(subsection_pte)
             else:
@@ -347,7 +390,7 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
                      subsection_base) * 0x1000 / pte.obj_size +
                     subsection.StartingSector * 512)
 
-                return self.task_as.base.get_mapped_offset(filename, file_offset)
+                return self.proc_as.base.get_mapped_offset(filename, file_offset)
 
 
     def is_page_executable(self, vaddr, pte_value):
@@ -358,14 +401,14 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
         executable = False
         phys_addr = None
 
-        if self._is_demand_zero_pte(pte_value):
+        if self.is_demand_zero_pte(pte_value):
             return None
 
         # active page
         if pte_value & self.valid_mask:
-            if not pte_value & self.nx_mask:
-                pfn = ((pte_value & self.hard_pfn_mask) >> self.hard_pfn_start)
-                phys_addr = (pfn << self.hard_pfn_start | (vaddr & 0xfff))
+            if not (pte_value & self.nx_mask):
+                phys_addr = \
+                    self._get_phys_addr_from_pte(vaddr, pte_value)
                 executable = True
             else:
                 return None
@@ -380,15 +423,14 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
                 # We observed this state for mapped data files
                 # with no COPY-ON-WRITE.
                 # As it is unusual to have a data file mapped with
-                # executable rights, we report these.       
+                # executable rights, we report these.
                 if protection_value in self._executable_choices:
                     # Gathering the physical address this way at this point
                     # is inefficient, as it traverses the page tables again,
                     # but since this state is reached very seldom, we use this
                     # lazy approach for now.
                     phys_addr = \
-                        self.task_as._get_phys_addr_from_pte(
-                            vaddr, pte_value)
+                        self.proc_as._get_phys_addr_from_pte(vaddr, pte_value)
                     executable = True
 
                 else:
@@ -400,10 +442,10 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
                                     self.proto_protection_start)
                 if protection_value in self._executable_choices:
                     phys_addr = \
-                        self.task_as._get_phys_addr_from_pte(vaddr, pte_value)
+                        self.proc_as._get_phys_addr_from_pte(vaddr, pte_value)
                     executable = True
                 else:
-                    proto_value = self.task_as.read(proto_address,8)
+                    proto_value = self.proc_as.read(proto_address,8)
                     proto_value = struct.unpack('<Q', proto_value)[0]
                     return self.is_page_executable_proto(vaddr, proto_value)
 
@@ -414,7 +456,7 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
                     self._executable_choices:
                 pfn = ((pte_value & self.trans_pfn_mask) >>
                        self.trans_pfn_start)
-                phys_addr = (pfn << self.trans_pfn_start | vaddr & 0xfff)
+                phys_addr = (pfn << self.PAGE_BITS | vaddr & 0xfff)
                 executable = True
             else:
                 return None
@@ -437,7 +479,7 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
                 #      If the pagefile support doesn't work, the actual content
                 #      can't be read but the plugin will still report the page.
                 phys_addr = \
-                    self.task_as._get_pagefile_mapped_address(pagefile_num,
+                    self.proc_as._get_pagefile_mapped_address(pagefile_num,
                                                               pagefile_address)
                 executable = True
             else:
@@ -447,8 +489,8 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
             return addrspace.Run(start=vaddr,
                 end=vaddr + self.PAGE_SIZE,
                 file_offset=phys_addr,
-                address_space=self.task_as.base,
-                data={'pte_value': pte_value, 'proto': False})
+                address_space=self.proc_as.base,
+                data={'pte_value': pte_value, 'is_proto': False})
 
         # unknown state
         self.session.logging.warning(
@@ -464,14 +506,14 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
         executable = False
         phys_addr = None
 
-        if self._is_demand_zero_pte(pte_value):
+        if self.is_demand_zero_pte(pte_value):
             return None
 
         # active page
         if pte_value & self.valid_mask:
             if not pte_value & self.nx_mask:
-                pfn = ((pte_value & self.hard_pfn_mask) >> self.hard_pfn_start)
-                phys_addr = (pfn << self.hard_pfn_start | (vaddr & 0xfff))
+                phys_addr = \
+                    self._get_phys_addr_from_pte(vaddr, pte_value)
                 executable = True
             else:
                 return None
@@ -496,7 +538,7 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
                     self._executable_choices:
                 pfn = ((pte_value & self.trans_pfn_mask) >>
                        self.trans_pfn_start)
-                phys_addr = (pfn << self.trans_pfn_start | vaddr & 0xfff)
+                phys_addr = (pfn << self.PAGE_BITS | vaddr & 0xfff)
                 executable = True
             else:
                 return None
@@ -520,7 +562,7 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
                 #      If the pagefile support doesn't work, the actual content
                 #      can't be read but the plugin will still report the page.
                 phys_addr = \
-                    self.task_as._get_pagefile_mapped_address(pagefile_num,
+                    self.proc_as._get_pagefile_mapped_address(pagefile_num,
                                                               pagefile_address)
                 executable = True
             else:
@@ -530,8 +572,8 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
             return addrspace.Run(start=vaddr,
                 end=vaddr + self.PAGE_SIZE,
                 file_offset=phys_addr,
-                address_space=self.task_as.base,
-                data={'pte_value': pte_value, 'proto': True})
+                address_space=self.proc_as.base,
+                data={'pte_value': pte_value, 'is_proto': True})
 
         # unknown state
         self.session.logging.warning(
@@ -557,8 +599,8 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
             # Bits 31:5 come from CR3
             # Bits 4:3 come from bits 31:30 of the original linear address
             pdpte_addr = (self.dtb & 0xffffffe0) | ((vaddr & 0xc0000000) >> 27)
-            pdpte_value = self.task_as.read_pte(pdpte_addr)
-            if not pdpte_value & self.task_as.valid_mask:
+            pdpte_value = self.proc_as.read_pte(pdpte_addr)
+            if not pdpte_value & self.proc_as.valid_mask:
                 continue
 
             tmp1 = vaddr
@@ -575,16 +617,16 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
                 # Bits 11:3 are bits 29:21 of the linear address
                 pde_addr = ((pdpte_value & 0xffffffffff000) |
                             ((vaddr & 0x3fe00000) >> 18))
-                pde_value = self.task_as.read_pte(pde_addr)
+                pde_value = self.proc_as.read_pte(pde_addr)
 
                 # TODO paged out paging structures have valid bit unset,
                 # but if the pagefile is supplied, we still could read it.
-                if not (pde_value & self.task_as.valid_mask or 
+                if not (pde_value & self.proc_as.valid_mask or 
                         pde_value & self.proto_transition_mask ==
                         self.transition_mask):
                     continue
 
-                yield [vaddr, pde_value]
+                yield [vaddr, pde_value, pde_addr]
 
 
     # taken from rekall-core/rekall/plugins/addrspaces/amd64.py
@@ -597,7 +639,7 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
         pte_table_addr = ((pde_value & 0xffffffffff000) |
                           ((vaddr & 0x1ff000) >> 9))
 
-        data = self.task_as.base.read(pte_table_addr, 8 * 0x200)
+        data = self.proc_as.base.read(pte_table_addr, 8 * 0x200)
         pte_table = struct.unpack("<" + "Q" * 0x200, data)
 
         tmp2 = vaddr
@@ -610,31 +652,60 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
             if start >= next_vaddr:
                 continue
 
-            yield [vaddr, pte_value]
+            yield [vaddr, pte_value, pte_table_addr + i * 8]
+
+
+    def get_all_pages_x86(self, start=0, end=2**64):
+
+        for pde_vaddr, pde_value, pde_addr in self.get_available_PDEs_x86(start, end):
+            if pde_value & self.proc_as.valid_mask and \
+                    pde_value & self.proc_as.page_size_mask:
+                # large page
+                phys_offset = (pde_value & 0xfffffffe00000) | (
+                                pde_vaddr & 0x1fffff)
+                yield addrspace.Run(
+                    start=pde_vaddr,
+                    end=pde_vaddr + self.LARGE_PAGE_SIZE,
+                    file_offset=phys_offset,
+                    address_space=self.proc_as.base,
+                    data={'pte_value': pde_value, 'is_proto': False, 'pte_addr': pde_addr})
+                continue
+            
+            for vaddr, pte_value, pte_addr in self.get_available_PTEs_x86(pde_vaddr,
+                                                                pde_value,
+                                                                start, end):
+                phys_offset = \
+                    self._get_phys_addr_from_pte(vaddr, pte_value)
+
+                yield addrspace.Run(start=vaddr,
+                    end=vaddr + self.PAGE_SIZE,
+                    file_offset=phys_offset,
+                    address_space=self.proc_as.base,
+                    data={'pte_value': pte_value, 'is_proto': False, 'pte_addr': pte_addr, 'pfn': pfn})
 
 
     def get_executable_pages_x86(self, start=0, end=2**64):
 
-        for pde_vaddr, pde_value in self.get_available_PDEs_x86(start, end):
-            if pde_value & self.task_as.valid_mask and \
-                    pde_value & self.task_as.page_size_mask:
+        for pde_vaddr, pde_value, _ in self.get_available_PDEs_x86(start, end):
+            if pde_value & self.proc_as.valid_mask and \
+                    pde_value & self.proc_as.page_size_mask:
                 if not pde_value & self.nx_mask:
                     yield addrspace.Run(
                         start=pde_vaddr,
-                        end=pde_vaddr+0x200000,
+                        end=pde_vaddr+self.LARGE_PAGE_SIZE,
                         file_offset=(pde_value & 0xfffffffe00000) | (
                             vaddr & 0x1fffff),
-                        address_space=self.task_as.base)
+                        address_space=self.proc_as.base)
                 continue
             
-            for vaddr, pte_value in self.get_available_PTEs_x86(pde_vaddr,
+            for vaddr, pte_value, _ in self.get_available_PTEs_x86(pde_vaddr,
                                                                 pde_value,
                                                                 start, end):
                 run = self.is_page_executable(vaddr, pte_value)
                 if run:
                     yield run
-                            
-                            
+
+
     def _init_masks(self):
         pte = self.session.profile._MMPTE()
         self.prototype_mask = pte.u.Proto.Prototype.mask
@@ -663,6 +734,7 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
         self.hard_pfn_start = pte.u.Hard.PageFrameNumber.start_bit
         self.trans_pfn_mask = pte.u.Trans.PageFrameNumber.mask
         self.trans_pfn_start = pte.u.Trans.PageFrameNumber.start_bit
+        self.large_page_mask = pte.u.Hard.LargePage.mask
 
 
     def _init_enums(self):
@@ -674,12 +746,13 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
             [int(k) for k, v in enum.items() if 'WRITE' in v.upper()]
 
 
-    def get_vad_for_address(self, address):
+    def get_vad_for_address(self, address, supress_warning=False):
         vad_run = self.session.address_resolver._address_ranges.get_containing_range(address)
         if not vad_run[2]:
-            self.session.logging.warning(
-                "No VAD found for task {:d} and address 0x{:x}"
-                .format(self.task.pid, address))
+            if not supress_warning:
+                self.session.logging.warning(
+                    "No VAD found for process {:d} and address 0x{:x}"
+                    .format(self.proc.pid, address))
             return None
         return vad_run[2].vad
 
@@ -710,8 +783,8 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
         renderer.section()
         renderer.format(
             "Process: {0} Pid: {1} Address: {2:#x}\n",
-            self.task.ImageFileName,
-            self.task.UniqueProcessId,
+            self.proc.ImageFileName,
+            self.proc.UniqueProcessId,
             memory_area_start)
 
         if type(vad) == int:
@@ -755,7 +828,7 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
                     "here.\n") 
                 renderer.format("\n")
                 return
-    
+
             first_byte = \
                 self.plugin_args.start &~ 0xfff if self.plugin_args.start \
                                                 else memory_area_start
@@ -797,7 +870,7 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
                 memory_area_end = vad.End
 
             filename = "{0}.{1:d}.{2}.0x{3:08x}-0x{4:08x}.dmp".format(
-                self.task.ImageFileName, self.task.pid, type_string,
+                self.proc.ImageFileName, self.proc.pid, type_string,
                 memory_area_start, memory_area_end)
     
             with renderer.open(directory=self.dump_dir,
@@ -807,11 +880,11 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
 
                 if type(vad) == int:
                     fd.write(
-                        self.task_as.read(memory_area_start,
+                        self.proc_as.read(memory_area_start,
                                           first_printable_page.length - 1))
                 
                 else:
-                    self.CopyToFile(self.task_as, memory_area_start,
+                    self.CopyToFile(self.proc_as, memory_area_start,
                                     memory_area_end, fd)
 
             filename = filename[:-3] + 'idx'
@@ -820,7 +893,7 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
                                mode='w') as fd:
                 self.session.report_progress(
                     "Writing index file %s" % filename)
-    
+
                 indexes = "\n".join(
                     [hex(x.start - memory_area_start)
                      for x in pages['x_pages']])
@@ -848,30 +921,45 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
         return None
 
 
-    def init_for_task(self, task=None):
-        if not task:
-            task = self.session.GetParameter("process_context")
+    def init_for_proc(self, proc=None):
+        if not proc:
+            proc = self.session.GetParameter("process_context")
 
         cc = self.session.plugins.cc()
-        self.task = task
-        self.task_as = task.get_process_address_space()
-        cc.SwitchProcessContext(task)
-        if not self.task_as or \
-                self.task_as == self.session.kernel_address_space:
+        self.proc = proc
+        self.proc_as = proc.get_process_address_space()
+        if not self.proc_as or \
+                self.proc_as == self.session.kernel_address_space:
             return False
-
-        self.vad = None
-        self.dtb = task.dtb
+        
+        cc.SwitchProcessContext(proc)
+        self.dtb = proc.dtb
         self.session.address_resolver._EnsureInitialized()
         return True
-      
+
+
+class PTEMalfind(core.DirectoryDumperMixin, PteEnumerator):
+
+    name = "ptemalfind"
+    dump_dir_optional = True
+    default_dump_dir = None
+
+    __args = [
+        dict(name='start', type='IntParser', default=0,
+             help=("The lowest address to examine; default=0")),
+        dict(name='end', type='IntParser', default=None,
+             help=("Upper limit address to examine; default: highest usermode "
+                   "address")),
+        dict(name='ignore_image_files', type='Boolean', default=False,
+             help=("Don't print executable pages belonging to mapped files."))
+    ]
 
     def render(self, renderer):
         # used for pages not belonging to any vad
         no_vad_counter = 0
-        for task in self.filter_processes():
+        for proc in self.filter_processes():
 
-            if not self.init_for_task(task):
+            if not self.init_for_proc(proc):
                 continue
 
             result = {}
@@ -881,7 +969,7 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
             for run in self.get_exec_pages_method(start=self.plugin_args.start,
                                                   end=end):
                 self.session.report_progress(
-                    "Inspecting Pid %d: 0x%08X", task.pid, run.start)
+                    "Inspecting Pid %d: 0x%08X", proc.pid, run.start)
                 vad = self.get_vad_for_address(run.start)
                 if not vad:
                     # Each page not belonging to a vad is printed separately.
@@ -903,9 +991,9 @@ class PteEnumerator(core.DirectoryDumperMixin, common.WinProcessFilter):
                 vad_should_be_printed = False
                 drop_these_pages = []
                 for run in pages['x_pages']:
-                    proto = run.data['proto']
+                    proto = run.data['is_proto']
                     if not proto and run.file_offset:
-                        pfn = run.file_offset >> 12
+                        pfn = run.file_offset >> self.PAGE_BITS
                         proto = self.mmpfn_db[pfn].u4.PrototypePte
                     
                     if proto and vad_contains_imagefile == None:
