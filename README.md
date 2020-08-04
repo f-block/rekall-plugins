@@ -46,7 +46,7 @@ rekall -f mem.dump pointerdetector 744
 
 
 # ptemalfind (formerly known as ptenum)
-This module implements a class to enumerate all Page Table Entries (PTEs) and a plugin (ptemalfind), using this class, which can be seen as an improved version of
+[This module](ptenum.py) implements a class to enumerate all Page Table Entries (PTEs) and a plugin (ptemalfind), using this class, which can be seen as an improved version of
 malfind. It retrieves a page's actual protection from its PTE value and from that its executable state, despite any hiding technique described in the following paper.
 
 The most current version of the plugin is in this repository. Other resources:
