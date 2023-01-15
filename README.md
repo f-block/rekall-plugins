@@ -1,3 +1,5 @@
+This repository is archived since Rekall has been discontinued. For the Volatility 3 version of these plugins see [here](https://github.com/f-block/volatility-plugins).
+
 # pointer_detector
 
 This plugin numerates all exported functions from all loaded DLLs and searches the memory for any pointer to them (essentially a search for dynamically resolved APIs). This plugin can assist in identifying dynamically resolved APIs and especially memory regions containing DLLs loaded with techniques such as reflective DLL injection.
